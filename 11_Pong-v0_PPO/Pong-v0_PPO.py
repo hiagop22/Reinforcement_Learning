@@ -1,9 +1,15 @@
 # Tutorial by www.pylessons.com
-# Tutorial written for - Tensorflow 1.15, Keras 2.2.4
+# Tutorial written for - Tensorflow 2.1.0, Keras 2.3.1
+# REMARK: The bellow code is modified to run in a kernel from Kaggle (https://www.kaggle.com/)
+
+# %% 
+# !pip install gym[atari] # -> uncomment this line if still it's necessary to install gym environment
+
+# %% 
 
 import os
 #os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+# os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 import random
 import gym
 import pylab
@@ -15,17 +21,24 @@ from keras import backend as K
 import cv2
 
 import tensorflow as tf
-from keras.backend.tensorflow_backend import set_session
 import threading
 from threading import Thread, Lock
 import time
 
-config = tf.ConfigProto()
+# Used to automate the number of workers
+import multiprocessing
+
+from numba import cuda # Release GPU memory
+
+# Remark: It's important use the latest version from tensorflow in this kernel, because using an old version will turn impossible to use 
+# the gpu, because there's a specific compatibility with version of both and just is possible downgrade tensorflow, but not cuda
+# See this link for more details.: https://stackoverflow.com/questions/50622525/which-tensorflow-and-cuda-version-combinations-are-compatible
+
+K.clear_session() # reset the graphs and sessions
+config = tf.compat.v1.ConfigProto(allow_soft_placement=True, log_device_placement=True)
 config.gpu_options.allow_growth = True # tells cuda not to use as much VRAM as it wants (as we nneed extra ram for all the other processes)
-sess = tf.Session(config=config)
-set_session(sess)
-K.set_session(sess)
-graph = tf.get_default_graph()
+sess = tf.compat.v1.Session(config=config, graph=tf.compat.v1.get_default_graph())
+sess.as_default()
 
 def OurModel(input_shape, action_space, lr):
     X_input = Input(input_shape)
@@ -81,6 +94,8 @@ class PPOAgent:
         self.COLS = 80
         self.REM_STEP = 4
         self.EPOCHS = 10
+        
+        self.keep_running_thread = True # Flag used to kill the threads
 
         # Instantiate plot memory
         self.scores, self.episodes, self.average = [], [], []
@@ -94,13 +109,16 @@ class PPOAgent:
 
         # Create Actor-Critic network model
         self.Actor, self.Critic = OurModel(input_shape=self.state_size, action_space = self.action_size, lr=self.lr)
-
+        
         self.Actor._make_predict_function()
+        self.Actor._make_train_function()
         self.Critic._make_predict_function()
+        self.Critic._make_train_function()
 
-        global graph
-        graph = tf.get_default_graph()
-
+        self.session = tf.compat.v1.keras.backend.get_session()
+        self.graph = tf.compat.v1.get_default_graph()    
+        self.graph.finalize()   # graph is not thread-safe, so you need to finilize it... Don't use global graphs with thread
+        
     def act(self, state):
         # Use the network to predict the next action to take, using the model
         prediction = self.Actor.predict(state)[0]
@@ -279,56 +297,82 @@ class PPOAgent:
                     envs[i],
                     i)) for i in range(n_threads)]
 
-        for t in threads:
-            time.sleep(2)
-            t.start()
-
-        for t in threads:
-            time.sleep(10)
-            t.join()
+        try: 
+            for t in threads:
+                time.sleep(2)
+                t.start()
+            
+            for t in threads:
+                time.sleep(4)
+                t.join()
+                
+        except (KeyboardInterrupt, SystemExit):
+                # Daemon seem doesn't work with kaggle, so all resources allocated
+                # by threads will keept used and maybe the own threads don't be finished.
+                # That's ocorred when I used kaggle, when I tried finish just the main thread 
+                # other threads keept runing even using True Daemon. So a solution was use a flag
+                # that switc the states and raise inside the threads turning possible break a lot 
+                # of while at once, and the try/except enable doesn't generate a exception error message
+                print("########### Exiting all threads...It may take a while ###########")
+                self.keep_running_thread = False
+                for t in threads:
+                    t.join()
+                print('All threads are finished....')
+                
+                # Release resources allocated during training
+                self.session.close()
+                
+                # Release GPU memory - Comment bellow lines if you're not using GPU
+                device = cuda.get_current_device()
+                device.reset()
             
     def train_threading(self, agent, env, thread):
-        global graph
-        with graph.as_default():
-            while self.episode < self.EPISODES:
-                # Reset episode
-                score, done, SAVING = 0, False, ''
-                state = self.reset(env)
-                # Instantiate or reset games memory
-                states, actions, rewards, predictions = [], [], [], []
-                while not done:
-                    action, prediction = agent.act(state)
-                    next_state, reward, done, _ = self.step(action, env, state)
+        try:
+            with self.session.as_default():
+                while self.episode < self.EPISODES:
+                    # Reset episode
+                    score, done, SAVING = 0, False, ''
+                    state = self.reset(env)
+                    # Instantiate or reset games memory
+                    states, actions, rewards, predictions = [], [], [], []
+                    while not done:
+                        # The raise inside the threads turn possible break a lot of while at once,
+                        # and the try/except enable doesn't generate a exception error message
+                        if not self.keep_running_thread: raise KeyboardInterrupt
+                        action, prediction = agent.act(state)
+                        next_state, reward, done, _ = self.step(action, env, state)
 
-                    states.append(state)
-                    action_onehot = np.zeros([self.action_size])
-                    action_onehot[action] = 1
-                    actions.append(action_onehot)
-                    rewards.append(reward)
-                    predictions.append(prediction)
-                    
-                    score += reward
-                    state = next_state
+                        states.append(state)
+                        action_onehot = np.zeros([self.action_size])
+                        action_onehot[action] = 1
+                        actions.append(action_onehot)
+                        rewards.append(reward)
+                        predictions.append(prediction)
 
-                self.lock.acquire()
-                self.replay(states, actions, rewards, predictions)
-                self.lock.release()
+                        score += reward
+                        state = next_state
 
-                # Update episode count
-                with self.lock:
-                    average = self.PlotModel(score, self.episode)
-                    # saving best models
-                    if average >= self.max_average:
-                        self.max_average = average
-                        self.save()
-                        SAVING = "SAVING"
-                    else:
-                        SAVING = ""
-                    print("episode: {}/{}, thread: {}, score: {}, average: {:.2f} {}".format(self.episode, self.EPISODES, thread, score, average, SAVING))
-                    if(self.episode < self.EPISODES):
-                        self.episode += 1
-            env.close()            
+                    self.lock.acquire()
+                    self.replay(states, actions, rewards, predictions)
+                    self.lock.release()
 
+                    # Update episode count
+                    with self.lock:
+                        average = self.PlotModel(score, self.episode)
+                        # saving best models
+                        if average >= self.max_average:
+                            self.max_average = average
+                            self.save()
+                            SAVING = "SAVING"
+                        else:
+                            SAVING = ""
+                        print("episode: {}/{}, thread: {}, score: {}, average: {:.2f} {}".format(self.episode, self.EPISODES, thread, score, average, SAVING))
+                        if(self.episode < self.EPISODES):
+                            self.episode += 1
+                env.close()            
+        except KeyboardInterrupt:
+            print('Thread {} killed.'.format(thread))
+        
     def test(self, Actor_name, Critic_name):
         self.load(Actor_name, Critic_name)
         for e in range(100):
@@ -345,11 +389,15 @@ class PPOAgent:
                     break
         self.env.close()
 
+# That's a good form for me to automate the choice of number of workers
+n_workers = multiprocessing.cpu_count()
+print(n_workers)
+        
 if __name__ == "__main__":
     #env_name = 'PongDeterministic-v4'
     env_name = 'Pong-v0'
     agent = PPOAgent(env_name)
     #agent.run() # use as PPO
-    #agent.train(n_threads=5) # use as APPO
+    agent.train(n_threads=n_workers) # use as APPO
     #agent.test('Models/Pong-v0_APPO_0.0001_Actor.h5', '')
-    agent.test('Models/Pong-v0_APPO_0.0001_Actor_CNN.h5', '')
+#     agent.test('Models/Pong-v0_APPO_0.0001_Actor_CNN.h5', '')
